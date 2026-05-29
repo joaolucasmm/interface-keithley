@@ -80,6 +80,12 @@
         @click="modoOperacao = 'iv'">
         ⚡ Medição I/V Simultânea
       </button>
+      <button 
+        v-if="resultadosIV.length > 0"
+        :class="{'tab-active': modoOperacao === 'grafico'}" 
+        @click="mostrarGrafico">
+        📈 Gráfico I x V
+      </button>
     </div>
 
     <!-- Modo Simples -->
@@ -152,6 +158,55 @@
       </button>
     </div>
 
+    <!-- Modo Gráfico I x V -->
+<div v-if="modoOperacao === 'grafico' && resultadosIV.length > 0" class="card" key="grafico-card">
+  <h2>📈 Curva Característica I x V</h2>
+  
+  <div class="chart-controls">
+    <div class="chart-type-selector">
+      <button @click="atualizarTipoGrafico('iv')" :class="{'active': tipoGrafico === 'iv'}" class="btn-small">
+        📊 I x V (Corrente vs Tensão)
+      </button>
+      <button @click="atualizarTipoGrafico('vi')" :class="{'active': tipoGrafico === 'vi'}" class="btn-small">
+        📈 V x I (Tensão vs Corrente)
+      </button>
+      <button @click="atualizarTipoGrafico('pv')" :class="{'active': tipoGrafico === 'pv'}" class="btn-small">
+        ⚡ P x V (Potência vs Tensão)
+      </button>
+    </div>
+    
+    <div class="chart-view-options">
+      <label>
+        <input type="checkbox" v-model="mostrarPontos" @change="atualizarPontos"> Mostrar Pontos
+      </label>
+      <label v-if="tipoGrafico === 'iv'">
+        <input type="checkbox" v-model="escalaLog" @change="atualizarEscalaLog"> Escala Logarítmica (Corrente)
+      </label>
+    </div>
+  </div>
+  
+  <!-- Container fixo para o canvas -->
+  <div class="chart-container" ref="chartContainer">
+    <canvas ref="chartCanvas"></canvas>
+  </div>
+  
+  <div class="chart-stats">
+    <div class="stat-item">
+      <span class="stat-label">Ponto de máxima potência:</span>
+      <span class="stat-value">{{ pontoMaxPotencia.vMPP.toFixed(3) }} V @ {{ pontoMaxPotencia.iMPP.toExponential(3) }} A ({{ pontoMaxPotencia.pMPP.toExponential(3) }} W)</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Resistência estimada (região linear):</span>
+      <span class="stat-value">{{ resistenciaEstimada.toExponential(3) }} Ω</span>
+    </div>
+  </div>
+  
+  <div class="chart-actions">
+    <button @click="exportarGrafico" class="btn-secondary">📸 Exportar Gráfico (PNG)</button>
+    <button @click="voltarParaTabela" class="btn-secondary">📊 Voltar para Tabela</button>
+  </div>
+</div>
+
     <!-- Resultados Modo Simples -->
     <div class="card" v-if="modoOperacao === 'simples' && resultados.length > 0">
       <h2>📊 Resultados</h2>
@@ -205,19 +260,25 @@
         </tbody>
       </table>
 
-      <button @click="exportarCSV_IV" class="btn-secondary">📥 Exportar CSV (I/V)</button>
+      <div class="action-buttons">
+        <button @click="mostrarGrafico" class="btn-primary">📈 Ver Gráfico I x V</button>
+        <button @click="exportarCSV_IV" class="btn-secondary">📥 Exportar CSV (I/V)</button>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
+import { Chart, registerables } from 'chart.js'
+
+// Registra todos os componentes do Chart.js
+Chart.register(...registerables)
 
 // ============================================
 // DETECÇÃO AUTOMÁTICA DO MODO (MOCK ou REAL)
 // ============================================
 
-// Detecta qual backend está rodando baseado na URL atual e em endpoints disponíveis
 const detectMode = async () => {
   const currentUrl = window.location.origin
   const realBaseUrl = 'http://127.0.0.1:8001/api'
@@ -240,7 +301,6 @@ const detectMode = async () => {
     return { isMock: false, baseUrl: currentUrl + '/api' }
   }
 
-  // Se não estiver usando uma porta conhecida, tenta detectar automaticamente pela saúde da API.
   if (await probe(`${realBaseUrl}/health`)) {
     return { isMock: false, baseUrl: realBaseUrl }
   }
@@ -257,10 +317,15 @@ const API_BASE_URL = ref('http://127.0.0.1:8000/api')
 const conectando = ref(false)
 const statusConectado = ref(false)
 
-// Modo de operação ('simples' ou 'iv')
+// Modo de operação
 const modoOperacao = ref('simples')
+const tipoGrafico = ref('iv')
+const mostrarPontos = ref(true)
+const escalaLog = ref(false)
+const chartInstance = ref(null)
+const chartCanvas = ref(null)
 
-// Parâmetros para medição simples
+// Parâmetros
 const parametros = ref({
   num_leituras: 5,
   delay_entre_leituras: 0.5,
@@ -268,7 +333,6 @@ const parametros = ref({
   nivel_tensao_aplicada: 0.0
 })
 
-// Parâmetros para medição I/V
 const parametrosIV = ref({
   num_leituras: 5,
   delay_entre_leituras: 0.5,
@@ -285,7 +349,7 @@ const resultadosIV = ref([])
 const medindoIV = ref(false)
 const statusMensagemIV = ref('')
 
-// Configuração do Mock (só usada se isMockMode for true)
+// Mock config
 const mockConfig = ref({
   modo: 'realista',
   ruido: 0.001,
@@ -296,27 +360,49 @@ const mockConfig = ref({
   max: 10
 })
 
-// Função auxiliar para requisições fetch
-const apiRequest = async (url, options = {}) => {
-  const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers
-    },
-    ...options
-  })
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ mensagem: 'Erro na requisição' }))
-    throw new Error(error.mensagem || `HTTP ${response.status}`)
+// ============================================
+// PROPRIEDADES COMPUTADAS
+// ============================================
+
+const pontoMaxPotencia = computed(() => {
+  if (resultadosIV.value.length === 0) {
+    return { vMPP: 0, iMPP: 0, pMPP: 0 }
   }
   
-  return response.json()
-}
+  let maxP = 0
+  let vAtMaxP = 0
+  let iAtMaxP = 0
+  
+  for (const med of resultadosIV.value) {
+    if (med.potencia > maxP) {
+      maxP = med.potencia
+      vAtMaxP = med.tensao
+      iAtMaxP = med.corrente
+    }
+  }
+  
+  return { vMPP: vAtMaxP, iMPP: iAtMaxP, pMPP: maxP }
+})
 
-// ============================================
-// COMPUTED PROPERTIES
-// ============================================
+const resistenciaEstimada = computed(() => {
+  if (resultadosIV.value.length < 2) return 0
+  
+  const pontos = resultadosIV.value.filter(m => m.tensao > 0.1 && m.corrente > 1e-6)
+  if (pontos.length < 2) return 0
+  
+  const n = pontos.length
+  const sumV = pontos.reduce((s, p) => s + p.tensao, 0)
+  const sumI = pontos.reduce((s, p) => s + p.corrente, 0)
+  const sumVI = pontos.reduce((s, p) => s + p.tensao * p.corrente, 0)
+  const sumV2 = pontos.reduce((s, p) => s + p.tensao * p.tensao, 0)
+  
+  const denominator = n * sumV2 - sumV * sumV
+  if (denominator === 0) return 0
+  
+  const invR = (n * sumVI - sumV * sumI) / denominator
+  return 1 / invR
+})
+
 const unidade = computed(() => {
   return parametros.value.modo_medicao === 'tensao' ? 'V' : 'A'
 })
@@ -356,6 +442,227 @@ const mediaPotencia = computed(() => {
 })
 
 // ============================================
+// FUNÇÕES DO GRÁFICO
+// ============================================
+
+const chartContainer = ref(null)
+let isCreatingChart = false
+
+const criarGrafico = () => {
+  // Previne criação múltipla simultânea
+  if (isCreatingChart) return
+  if (!chartCanvas.value || resultadosIV.value.length === 0) return
+  
+  isCreatingChart = true
+  
+  // Destroi instância anterior se existir
+  if (chartInstance.value) {
+    chartInstance.value.destroy()
+    chartInstance.value = null
+  }
+  
+  // Força o container a ter tamanho fixo antes de criar o canvas
+  if (chartContainer.value) {
+    chartContainer.value.style.width = '100%'
+    chartContainer.value.style.height = '450px'
+  }
+  
+  // Prepara os dados
+  let dadosX = []
+  let dadosY = []
+  let labelX = ''
+  let labelY = ''
+  let titulo = ''
+  let cor = ''
+  
+  if (tipoGrafico.value === 'iv') {
+    dadosX = resultadosIV.value.map(m => m.tensao)
+    dadosY = resultadosIV.value.map(m => escalaLog.value ? Math.max(Math.abs(m.corrente), 1e-12) : m.corrente)
+    labelX = 'Tensão (V)'
+    labelY = escalaLog.value ? 'Corrente (A) - Escala Log' : 'Corrente (A)'
+    titulo = 'Curva I x V'
+    cor = 'rgba(54, 162, 235, 0.7)'
+  } else if (tipoGrafico.value === 'vi') {
+    dadosX = resultadosIV.value.map(m => m.corrente)
+    dadosY = resultadosIV.value.map(m => m.tensao)
+    labelX = 'Corrente (A)'
+    labelY = 'Tensão (V)'
+    titulo = 'Curva V x I'
+    cor = 'rgba(255, 99, 132, 0.7)'
+  } else {
+    dadosX = resultadosIV.value.map(m => m.tensao)
+    dadosY = resultadosIV.value.map(m => m.potencia)
+    labelX = 'Tensão (V)'
+    labelY = 'Potência (W)'
+    titulo = 'Potência vs Tensão'
+    cor = 'rgba(75, 192, 192, 0.7)'
+  }
+  
+  // Configuração da escala Y
+  let escalaY = {}
+  if (tipoGrafico.value === 'iv' && escalaLog.value) {
+    escalaY = {
+      type: 'logarithmic',
+      title: { display: true, text: labelY, font: { size: 14, weight: 'bold' } },
+      ticks: { 
+        callback: (value) => value.toExponential(2),
+        stepSize: 1
+      },
+      grid: { color: 'rgba(0,0,0,0.1)' }
+    }
+  } else {
+    escalaY = {
+      type: 'linear',
+      title: { display: true, text: labelY, font: { size: 14, weight: 'bold' } },
+      grid: { color: 'rgba(0,0,0,0.1)' }
+    }
+  }
+  
+  // Cria o gráfico - SEM setTimeout e SEM resize manual
+  const canvas = chartCanvas.value
+  const ctx = canvas.getContext('2d')
+  
+  chartInstance.value = new Chart(ctx, {
+    type: 'scatter',
+    data: {
+      datasets: [{
+        label: titulo,
+        data: dadosX.map((x, i) => ({ x: x, y: dadosY[i] })),
+        borderColor: cor,
+        backgroundColor: cor.replace('0.7', '0.1'),
+        borderWidth: 2,
+        pointRadius: mostrarPontos.value ? 5 : 0,
+        pointHoverRadius: 7,
+        pointBackgroundColor: cor,
+        pointBorderColor: '#fff',
+        showLine: true,
+        tension: 0.1,
+        fill: false,
+        order: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { 
+          position: 'top',
+          labels: { font: { size: 12 } }
+        },
+        tooltip: {
+          mode: 'index',
+          intersect: false,
+          callbacks: {
+            label: function(context) {
+              const point = context.raw
+              if (tipoGrafico.value === 'iv') {
+                return [`Tensão: ${point.x.toFixed(4)} V`, `Corrente: ${point.y.toExponential(6)} A`]
+              } else if (tipoGrafico.value === 'vi') {
+                return [`Corrente: ${point.x.toExponential(6)} A`, `Tensão: ${point.y.toFixed(4)} V`]
+              } else {
+                return [`Tensão: ${point.x.toFixed(4)} V`, `Potência: ${point.y.toExponential(6)} W`]
+              }
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          title: { display: true, text: labelX, font: { size: 14, weight: 'bold' } },
+          ticks: { 
+            callback: (value) => value.toFixed(3),
+            autoSkip: true,
+            maxTicksLimit: 10
+          },
+          grid: { color: 'rgba(0,0,0,0.1)' }
+        },
+        y: escalaY
+      },
+      elements: {
+        line: {
+          borderJoin: 'round'
+        }
+      },
+      layout: {
+        padding: {
+          top: 10,
+          bottom: 10,
+          left: 10,
+          right: 10
+        }
+      }
+    }
+  })
+  
+  isCreatingChart = false
+}
+
+const atualizarTipoGrafico = (tipo) => {
+  if (tipoGrafico.value === tipo) return // Evita recriação desnecessária
+  tipoGrafico.value = tipo
+  nextTick(() => {
+    criarGrafico()
+  })
+}
+
+const atualizarPontos = () => {
+  if (chartInstance.value) {
+    chartInstance.value.data.datasets[0].pointRadius = mostrarPontos.value ? 5 : 0
+    chartInstance.value.update('none') // Use 'none' para evitar animação desnecessária
+  }
+}
+
+const atualizarEscalaLog = () => {
+  // Recria o gráfico com nova escala
+  nextTick(() => {
+    criarGrafico()
+  })
+}
+
+const mostrarGrafico = () => {
+  modoOperacao.value = 'grafico'
+  // Aguarda o DOM ser completamente renderizado
+  nextTick(() => {
+    // Pequeno delay para garantir que o container está pronto
+    setTimeout(() => {
+      criarGrafico()
+    }, 50)
+  })
+}
+
+const voltarParaTabela = () => {
+  modoOperacao.value = 'iv'
+}
+
+const exportarGrafico = () => {
+  if (!chartCanvas.value) return
+  
+  const link = document.createElement('a')
+  const tipoTexto = tipoGrafico.value === 'iv' ? 'IV' : (tipoGrafico.value === 'vi' ? 'VI' : 'PV')
+  link.download = `grafico_${tipoTexto}_${new Date().toISOString().slice(0, 19)}.png`
+  link.href = chartCanvas.value.toDataURL()
+  link.click()
+}
+
+// ============================================
+// FUNÇÕES AUXILIARES
+// ============================================
+
+const apiRequest = async (url, options = {}) => {
+  const response = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...options.headers },
+    ...options
+  })
+  
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ mensagem: 'Erro na requisição' }))
+    throw new Error(error.mensagem || `HTTP ${response.status}`)
+  }
+  
+  return response.json()
+}
+
+// ============================================
 // MÉTODOS - CONEXÃO
 // ============================================
 const testarConexao = async () => {
@@ -375,7 +682,7 @@ const testarConexao = async () => {
 }
 
 // ============================================
-// MÉTODOS - MOCK CONFIG (só chamado se for mock)
+// MÉTODOS - MOCK CONFIG
 // ============================================
 const atualizarMockConfig = async () => {
   if (!isMockMode.value) return
@@ -410,9 +717,7 @@ const atualizarMockConfig = async () => {
 const resetMockCounter = async () => {
   if (!isMockMode.value) return
   try {
-    await apiRequest(`${API_BASE_URL.value}/mock/reset`, {
-      method: 'POST'
-    })
+    await apiRequest(`${API_BASE_URL.value}/mock/reset`, { method: 'POST' })
     console.log('Contador do mock resetado')
   } catch (error) {
     console.error('Erro ao resetar:', error)
@@ -428,9 +733,6 @@ const iniciarMedicao = async () => {
   statusMensagem.value = ''
 
   try {
-    console.log('🔵 Iniciando medição simples...')
-    console.log('📤 Parâmetros:', parametros.value)
-    
     const data = await apiRequest(`${API_BASE_URL.value}/medir`, {
       method: 'POST',
       body: JSON.stringify(parametros.value)
@@ -439,10 +741,8 @@ const iniciarMedicao = async () => {
     if (data.status === 'sucesso') {
       resultados.value = data.medicoes
       statusMensagem.value = data.mensagem || 'Medição concluída com sucesso!'
-      console.log('✅ Medição concluída:', resultados.value)
     }
   } catch (error) {
-    console.error('❌ Erro:', error)
     statusMensagem.value = error.message || 'Erro na comunicação com o backend'
     alert(`Erro: ${statusMensagem.value}`)
   } finally {
@@ -482,9 +782,6 @@ const iniciarMedicaoIV = async () => {
   statusMensagemIV.value = ''
 
   try {
-    console.log('🔵 Iniciando medição I/V...')
-    console.log('📤 Parâmetros:', parametrosIV.value)
-    
     const data = await apiRequest(`${API_BASE_URL.value}/medir_iv`, {
       method: 'POST',
       body: JSON.stringify(parametrosIV.value)
@@ -493,10 +790,8 @@ const iniciarMedicaoIV = async () => {
     if (data.status === 'sucesso') {
       resultadosIV.value = data.medicoes
       statusMensagemIV.value = data.mensagem || 'Medição IV concluída com sucesso!'
-      console.log('✅ Medição IV concluída:', resultadosIV.value.length, 'leituras')
     }
   } catch (error) {
-    console.error('❌ Erro:', error)
     statusMensagemIV.value = error.message || 'Erro na medição IV'
     alert(`Erro: ${statusMensagemIV.value}`)
   } finally {
@@ -511,6 +806,8 @@ const exportarCSV_IV = () => {
   })
   
   csvContent += `\nMédias,,,\n,${mediaCorrente.value.toFixed(6)},${mediaTensao.value.toFixed(6)},${mediaPotencia.value.toFixed(6)}\n`
+  csvContent += `\nPonto de máxima potência,,,\n,${pontoMaxPotencia.value.iMPP.toExponential(3)},${pontoMaxPotencia.value.vMPP.toFixed(3)},${pontoMaxPotencia.value.pMPP.toExponential(3)}\n`
+  csvContent += `\nResistência estimada,,,\n,${resistenciaEstimada.value.toExponential(3)},,Ω\n`
   
   if (isMockMode.value) {
     csvContent += `\nModo de simulação,${mockConfig.value.modo}\n`
@@ -556,7 +853,6 @@ h1 {
   padding-bottom: 10px;
 }
 
-/* Mode indicator */
 .mode-indicator {
   text-align: center;
   padding: 10px;
@@ -577,7 +873,6 @@ h1 {
   border: 1px solid #c3e6cb;
 }
 
-/* Status bar */
 .status-bar {
   display: flex;
   justify-content: space-between;
@@ -604,11 +899,11 @@ h1 {
   color: #721c24;
 }
 
-/* Tabs */
 .tabs {
   display: flex;
   gap: 10px;
   margin-bottom: 20px;
+  flex-wrap: wrap;
 }
 
 .tabs button {
@@ -630,7 +925,6 @@ h1 {
   color: white;
 }
 
-/* Cards */
 .card {
   background: white;
   border: 1px solid #ddd;
@@ -644,7 +938,6 @@ h1 {
   border-left: 4px solid #ffc107;
 }
 
-/* Form groups */
 .form-group {
   margin-bottom: 15px;
 }
@@ -683,7 +976,6 @@ h1 {
   margin-top: 5px;
 }
 
-/* Buttons */
 .btn-primary {
   background: #42b983;
   color: white;
@@ -729,7 +1021,6 @@ h1 {
   background: #0056b3;
 }
 
-/* Results */
 .results-summary {
   background: #e8f4f8;
   padding: 15px;
@@ -765,7 +1056,90 @@ h1 {
   font-weight: bold;
 }
 
-/* Responsive */
+.action-buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 15px;
+}
+
+.action-buttons .btn-primary,
+.action-buttons .btn-secondary {
+  flex: 1;
+  margin-top: 0;
+}
+
+.chart-controls {
+  margin-bottom: 20px;
+}
+
+.chart-type-selector {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+  flex-wrap: wrap;
+}
+
+.chart-type-selector .btn-small {
+  background: #e0e0e0;
+  color: #333;
+}
+
+.chart-type-selector .btn-small.active {
+  background: #42b983;
+  color: white;
+}
+
+.chart-view-options {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 15px;
+  padding: 10px;
+  background: #f8f9fa;
+  border-radius: 8px;
+}
+
+.chart-view-options label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: normal;
+}
+
+
+.chart-stats {
+  background: #e8f4f8;
+  padding: 15px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.stat-item {
+  margin: 5px 0;
+  font-size: 14px;
+}
+
+.stat-label {
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.stat-value {
+  color: #42b983;
+  font-family: monospace;
+  font-size: 14px;
+}
+
+.chart-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.chart-actions .btn-secondary {
+  margin-top: 0;
+}
+
 @media (max-width: 768px) {
   .container {
     padding: 10px;
@@ -775,12 +1149,86 @@ h1 {
     flex-direction: column;
   }
   
+  .action-buttons {
+    flex-direction: column;
+  }
+  
+  .chart-type-selector {
+    flex-direction: column;
+  }
+  
+  .chart-view-options {
+    flex-direction: column;
+    gap: 10px;
+  }
+  
+  .chart-canvas {
+    height: 300px;
+  }
+  
   .results-table {
     font-size: 12px;
   }
   
   .results-table th, .results-table td {
     padding: 4px;
+  }
+}
+
+/* Wrapper com altura fixa para o canvas - IMPLEMENTAÇÃO CORRIGIDA */
+.chart-wrapper {
+  position: relative;
+  width: 100%;
+  height: 450px;
+  margin-bottom: 20px;
+}
+
+.chart-wrapper canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+/* Garante que o canvas tenha fundo branco */
+canvas {
+  background: white;
+  border-radius: 8px;
+}
+
+/* Responsivo para mobile */
+@media (max-width: 768px) {
+  .chart-wrapper {
+    height: 300px;
+  }
+}
+
+/* Container fixo para o canvas */
+.chart-container {
+  position: relative;
+  width: 100%;
+  height: 450px;
+  margin-bottom: 20px;
+  background: white;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.chart-container canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+/* Remove qualquer estilo que possa estar causando crescimento */
+canvas {
+  max-width: 100%;
+  background: white;
+}
+
+/* Responsivo para mobile */
+@media (max-width: 768px) {
+  .chart-container {
+    height: 300px;
   }
 }
 </style>
