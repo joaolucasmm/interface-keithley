@@ -1,34 +1,24 @@
 <template>
   <div class="container">
     <h1>🔬 Controle da Keithley 2611B</h1>
-    
-    <!-- Indicador de modo Mock/Real -->
-    <div class="mock-indicator" :class="{'mock-active': isMockMode}">
-      {{ isMockMode ? '🎭 MODO MOCK ATIVO' : '🔌 MODO REAL' }}
+    <!-- Indicador de modo (agora automático) -->
+    <div class="mode-indicator" :class="{'mock': isMockMode, 'real': !isMockMode}">
+      <span v-if="isMockMode">🎭 MODO SIMULAÇÃO ATIVO</span>
+      <span v-else>🔌 MODO REAL - Keithley Conectada</span>
     </div>
     
-    <!-- Botões para alternar entre real/mock -->
-    <div class="mode-buttons">
-      <button 
-        @click="switchToReal" 
-        :class="{'active': !isMockMode}" 
-        class="mode-btn"
-        :disabled="conectando"
-      >
-        🔌 Conectar Keithley Real
-      </button>
-      <button 
-        @click="switchToMock" 
-        :class="{'active': isMockMode}" 
-        class="mode-btn"
-        :disabled="conectando"
-      >
-        🎭 Usar Mock (Simulação)
+    <!-- Status da conexão -->
+    <div class="status-bar">
+      <div class="status-indicator" :class="{'connected': statusConectado, 'disconnected': !statusConectado}">
+        {{ statusConectado ? '✅ Conectado' : '❌ Desconectado' }}
+      </div>
+      <button @click="testarConexao" class="btn-small" :disabled="conectando">
+        {{ conectando ? '⏳ Testando...' : 'Testar Conexão' }}
       </button>
     </div>
 
     <!-- Configurações do Mock (visível apenas em modo mock) -->
-    <div v-if="isMockMode" class="card">
+    <div v-if="isMockMode" class="card mock-config">
       <h3>🎮 Configurações da Simulação</h3>
       
       <div class="form-group">
@@ -76,16 +66,6 @@
       </div>
       
       <button @click="resetMockCounter" class="btn-small">Resetar Contador</button>
-    </div>
-
-    <!-- Status da conexão -->
-    <div class="status-bar">
-      <div class="status-indicator" :class="{'connected': statusConectado, 'disconnected': !statusConectado}">
-        {{ statusConectado ? '✅ Conectado' : '❌ Desconectado' }}
-      </div>
-      <button @click="testarConexao" class="btn-small" :disabled="conectando">
-        {{ conectando ? '⏳ Testando...' : 'Testar Conexão' }}
-      </button>
     </div>
 
     <!-- Abas para alternar entre modos de medição -->
@@ -151,10 +131,10 @@
         <input 
           type="number" 
           v-model.number="parametrosIV.valor_fixo" 
-          :step="parametrosIV.modo === 'tensao_fixa' ? 0.1 : 0.001"
+          :step="parametrosIV.modo === 'tensao_fixa' ? 0.1 : 0.0001"
         >
         <small v-if="parametrosIV.modo === 'tensao_fixa'" class="hint">Valor típico: 1V a 200V</small>
-        <small v-else class="hint">Valor típico: 0.001A a 1.5A (10A pulse)</small>
+        <small v-else class="hint">Valor típico: 0.001A a 1.5A</small>
       </div>
 
       <div class="form-group">
@@ -234,36 +214,50 @@
 import { ref, computed, onMounted } from 'vue'
 
 // ============================================
-// CONFIGURAÇÕES
+// DETECÇÃO AUTOMÁTICA DO MODO (MOCK ou REAL)
 // ============================================
-const API_BASE_URL_REAL = 'http://localhost:8001/api'
-const API_BASE_URL_MOCK = 'http://localhost:8000/api'
 
-// Função auxiliar para requisições fetch
-const apiRequest = async (url, options = {}) => {
-  const response = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers
-    },
-    ...options
-  })
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ mensagem: 'Erro na requisição' }))
-    throw new Error(error.mensagem || `HTTP ${response.status}`)
+// Detecta qual backend está rodando baseado na URL atual e em endpoints disponíveis
+const detectMode = async () => {
+  const currentUrl = window.location.origin
+  const realBaseUrl = 'http://127.0.0.1:8001/api'
+  const mockBaseUrl = 'http://127.0.0.1:8000/api'
+
+  const probe = async (url) => {
+    try {
+      const response = await fetch(url, { method: 'GET' })
+      return response.ok
+    } catch {
+      return false
+    }
   }
-  
-  return response.json()
+
+  if (currentUrl.includes(':8000')) {
+    return { isMock: true, baseUrl: currentUrl + '/api' }
+  }
+
+  if (currentUrl.includes(':8001')) {
+    return { isMock: false, baseUrl: currentUrl + '/api' }
+  }
+
+  // Se não estiver usando uma porta conhecida, tenta detectar automaticamente pela saúde da API.
+  if (await probe(`${realBaseUrl}/health`)) {
+    return { isMock: false, baseUrl: realBaseUrl }
+  }
+
+  if (await probe(`${mockBaseUrl}/health`)) {
+    return { isMock: true, baseUrl: mockBaseUrl }
+  }
+
+  return { isMock: true, baseUrl: mockBaseUrl }
 }
 
-// Estado reativo
 const isMockMode = ref(true)
+const API_BASE_URL = ref('http://127.0.0.1:8000/api')
 const conectando = ref(false)
 const statusConectado = ref(false)
-const API_BASE_URL = ref(API_BASE_URL_MOCK)
 
-// Modo de operação
+// Modo de operação ('simples' ou 'iv')
 const modoOperacao = ref('simples')
 
 // Parâmetros para medição simples
@@ -291,7 +285,7 @@ const resultadosIV = ref([])
 const medindoIV = ref(false)
 const statusMensagemIV = ref('')
 
-// Configuração do Mock
+// Configuração do Mock (só usada se isMockMode for true)
 const mockConfig = ref({
   modo: 'realista',
   ruido: 0.001,
@@ -301,6 +295,24 @@ const mockConfig = ref({
   min: 0,
   max: 10
 })
+
+// Função auxiliar para requisições fetch
+const apiRequest = async (url, options = {}) => {
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    },
+    ...options
+  })
+  
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ mensagem: 'Erro na requisição' }))
+    throw new Error(error.mensagem || `HTTP ${response.status}`)
+  }
+  
+  return response.json()
+}
 
 // ============================================
 // COMPUTED PROPERTIES
@@ -346,18 +358,6 @@ const mediaPotencia = computed(() => {
 // ============================================
 // MÉTODOS - CONEXÃO
 // ============================================
-const switchToMock = async () => {
-  isMockMode.value = true
-  API_BASE_URL.value = API_BASE_URL_MOCK
-  await testarConexao()
-}
-
-const switchToReal = async () => {
-  isMockMode.value = false
-  API_BASE_URL.value = API_BASE_URL_REAL
-  await testarConexao()
-}
-
 const testarConexao = async () => {
   conectando.value = true
   try {
@@ -369,21 +369,13 @@ const testarConexao = async () => {
   } catch (error) {
     statusConectado.value = false
     console.error('Falha na conexão:', error.message)
-    if (!isMockMode.value) {
-      alert('⚠️ Não foi possível conectar à Keithley real.\n' +
-            'Verifique se:\n' +
-            '1. A Keithley está ligada e conectada via USB\n' +
-            '2. O servidor real está rodando (python main.py)\n' +
-            '3. A porta está correta (8001)\n\n' +
-            'Dica: Use o modo MOCK para teste!')
-    }
   } finally {
     conectando.value = false
   }
 }
 
 // ============================================
-// MÉTODOS - MOCK CONFIG
+// MÉTODOS - MOCK CONFIG (só chamado se for mock)
 // ============================================
 const atualizarMockConfig = async () => {
   if (!isMockMode.value) return
@@ -536,13 +528,21 @@ const exportarCSV_IV = () => {
 // ============================================
 // LIFECYCLE
 // ============================================
-onMounted(() => {
-  switchToMock()
+const initMode = async () => {
+  const detected = await detectMode()
+  isMockMode.value = detected.isMock
+  API_BASE_URL.value = detected.baseUrl
+}
+
+onMounted(async () => {
+  await initMode()
+  console.log(`🖥️ UI iniciada no modo: ${isMockMode.value ? 'MOCK' : 'REAL'}`)
+  console.log(`📍 API URL: ${API_BASE_URL.value}`)
+  await testarConexao()
 })
 </script>
 
 <style scoped>
-/* ... (mesmos estilos da versão anterior) ... */
 .container {
   max-width: 1200px;
   margin: 0 auto;
@@ -556,17 +556,8 @@ h1 {
   padding-bottom: 10px;
 }
 
-h2 {
-  color: #2c3e50;
-  margin-top: 0;
-}
-
-h3 {
-  color: #2c3e50;
-  margin-top: 0;
-}
-
-.mock-indicator {
+/* Mode indicator */
+.mode-indicator {
   text-align: center;
   padding: 10px;
   border-radius: 8px;
@@ -574,49 +565,19 @@ h3 {
   margin: 15px 0;
 }
 
-.mock-indicator.mock-active {
+.mode-indicator.mock {
   background: #fff3cd;
   color: #856404;
   border: 1px solid #ffeeba;
 }
 
-.mock-indicator:not(.mock-active) {
+.mode-indicator.real {
   background: #d4edda;
   color: #155724;
   border: 1px solid #c3e6cb;
 }
 
-.mode-buttons {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 20px;
-}
-
-.mode-btn {
-  flex: 1;
-  padding: 10px;
-  border: 2px solid #ddd;
-  background: white;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.3s;
-}
-
-.mode-btn.active {
-  background: #42b983;
-  color: white;
-  border-color: #42b983;
-}
-
-.mode-btn:hover:not(.active):not(:disabled) {
-  background: #f0f0f0;
-}
-
-.mode-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
+/* Status bar */
 .status-bar {
   display: flex;
   justify-content: space-between;
@@ -643,6 +604,7 @@ h3 {
   color: #721c24;
 }
 
+/* Tabs */
 .tabs {
   display: flex;
   gap: 10px;
@@ -668,6 +630,7 @@ h3 {
   color: white;
 }
 
+/* Cards */
 .card {
   background: white;
   border: 1px solid #ddd;
@@ -677,6 +640,11 @@ h3 {
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
 }
 
+.mock-config {
+  border-left: 4px solid #ffc107;
+}
+
+/* Form groups */
 .form-group {
   margin-bottom: 15px;
 }
@@ -715,6 +683,7 @@ h3 {
   margin-top: 5px;
 }
 
+/* Buttons */
 .btn-primary {
   background: #42b983;
   color: white;
@@ -760,6 +729,7 @@ h3 {
   background: #0056b3;
 }
 
+/* Results */
 .results-summary {
   background: #e8f4f8;
   padding: 15px;
@@ -795,16 +765,13 @@ h3 {
   font-weight: bold;
 }
 
+/* Responsive */
 @media (max-width: 768px) {
   .container {
     padding: 10px;
   }
   
   .tabs {
-    flex-direction: column;
-  }
-  
-  .mode-buttons {
     flex-direction: column;
   }
   
